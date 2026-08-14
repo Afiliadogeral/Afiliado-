@@ -1,0 +1,97 @@
+name: Bot de Afiliados
+
+on:
+  schedule:
+    # ── Horários estratégicos (Brasília = UTC-3) ───────────────────
+    # 07:30 BRT → Manhã   (acordando, checando celular)
+    - cron: "30 10 * * *"
+    # 12:30 BRT → Almoço  (pesquisando no horário de almoço)
+    - cron: "30 15 * * *"
+    # 19:30 BRT → Noite   (saindo do trabalho, maior intenção de compra)
+    - cron: "30 22 * * *"
+
+  # ── Disparo manual com escolha de período ─────────────────────────
+  workflow_dispatch:
+    inputs:
+      periodo:
+        description: "Período para testar manualmente"
+        required: false
+        default: "manha"
+        type: choice
+        options: [manha, tarde, noite]
+
+permissions:
+  contents: write
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Cache da sessão do Instagram entre execuções ──────────────
+      - name: Restaurar sessão Instagram (cache)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ig_sessao.json
+          key: ig-session-${{ runner.os }}
+
+      - name: Instalar dependências Python
+        run: pip install -r requirements.txt
+
+      - name: Instalar Chromium (Playwright)
+        run: playwright install chromium --with-deps
+
+      # ── Define o período baseado no cron que disparou ─────────────
+      - name: Definir período do dia
+        run: |
+          SCHEDULE="${{ github.event.schedule }}"
+          MANUAL="${{ github.event.inputs.periodo }}"
+          if   [ "$SCHEDULE" = "30 10 * * *" ]; then echo "PERIODO=manha"  >> $GITHUB_ENV
+          elif [ "$SCHEDULE" = "30 15 * * *" ]; then echo "PERIODO=tarde"  >> $GITHUB_ENV
+          elif [ "$SCHEDULE" = "30 22 * * *" ]; then echo "PERIODO=noite"  >> $GITHUB_ENV
+          elif [ -n "$MANUAL" ];                then echo "PERIODO=$MANUAL" >> $GITHUB_ENV
+          else                                       echo "PERIODO=manha"   >> $GITHUB_ENV
+          fi
+
+      # ── ETAPA 1: Scraping de ofertas ──────────────────────────────
+      - name: "🔍 Buscar ofertas (período: ${{ env.PERIODO }})"
+        run: python scraper.py
+
+      # ── ETAPA 2: Gerar links de afiliado ──────────────────────────
+      - name: "🔗 Gerar links de afiliado"
+        env:
+          ML_EMAIL:          ${{ secrets.ML_EMAIL }}
+          ML_PASSWORD:       ${{ secrets.ML_PASSWORD }}
+          ETIQUETA_AFILIADO: rafaelrafa13
+        run: python gerar_links.py
+
+      # ── ETAPA 3: Postar em todos os canais ────────────────────────
+      - name: "📢 Postar no Telegram, Instagram e WhatsApp"
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          INSTAGRAM_USERNAME:   ${{ secrets.INSTAGRAM_USERNAME }}
+          INSTAGRAM_PASSWORD:   ${{ secrets.INSTAGRAM_PASSWORD }}
+          PROXY_HOST:           ${{ secrets.PROXY_HOST }}
+          PROXY_PORT:           ${{ secrets.PROXY_PORT }}
+          PROXY_USER:           ${{ secrets.PROXY_USER }}
+          PROXY_PASS:           ${{ secrets.PROXY_PASS }}
+          EVOLUTION_API_URL:    ${{ secrets.EVOLUTION_API_URL }}
+          EVOLUTION_API_KEY:    ${{ secrets.EVOLUTION_API_KEY }}
+          EVOLUTION_INSTANCE:   ${{ secrets.EVOLUTION_INSTANCE }}
+          WHATSAPP_CHANNEL_JID: ${{ secrets.WHATSAPP_CHANNEL_JID }}
+        run: python postar.py
+
+      # ── Salva sessão Instagram no cache ───────────────────────────
+      - name: Salvar sessão Instagram (cache)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ig_sessao.json
+          key: ig-session-${{ runner.os }}
