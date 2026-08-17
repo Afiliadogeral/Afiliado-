@@ -186,6 +186,47 @@ def carregar_sessao_instagram(cl):
 
 # ── Período do dia ────────────────────────────────────────────────────────────
 
+def carregar_historico(caminho="historico_postados.json", dias_expiracao=21):
+    """
+    Carrega o histórico de URLs já postadas. Entradas mais antigas que
+    'dias_expiracao' dias são descartadas automaticamente — assim uma
+    oferta pode voltar a ser postada depois de um tempo (ex: se o
+    desconto voltar em outro mês), mas não se repete todo dia.
+    """
+    if not os.path.exists(caminho):
+        return {}
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            historico = json.load(f)
+    except Exception:
+        return {}
+
+    agora = datetime.utcnow()
+    valido = {}
+    for url, data_iso in historico.items():
+        try:
+            data = datetime.fromisoformat(data_iso)
+            if (agora - data).days < dias_expiracao:
+                valido[url] = data_iso
+        except Exception:
+            continue
+    return valido
+
+
+def salvar_historico(historico, caminho="historico_postados.json"):
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(historico, f, ensure_ascii=False, indent=2)
+
+
+def registrar_postagem(urls, caminho="historico_postados.json"):
+    """Adiciona URLs recém-postadas ao histórico, com timestamp atual."""
+    historico = carregar_historico(caminho)
+    agora_iso = datetime.utcnow().isoformat()
+    for url in urls:
+        historico[url] = agora_iso
+    salvar_historico(historico, caminho)
+
+
 def periodo_atual():
     """
     Retorna o período baseado na variável PERIODO do ambiente (definida pelo

@@ -2,23 +2,19 @@ name: Bot de Afiliados
 
 on:
   schedule:
-    # ── Horários estratégicos (Brasília = UTC-3) ───────────────────
-    # 07:30 BRT → Manhã   (acordando, checando celular)
-    - cron: "30 10 * * *"
-    # 12:30 BRT → Almoço  (pesquisando no horário de almoço)
-    - cron: "30 15 * * *"
-    # 19:30 BRT → Noite   (saindo do trabalho, maior intenção de compra)
-    - cron: "30 22 * * *"
+    # Roda a cada 30 minutos, o dia todo. O próprio job decide (no
+    # primeiro step) se está dentro da janela 07:30–22:00 (Brasília)
+    # e pula tudo o resto quando estiver fora dela — assim cobrimos
+    # a virada UTC sem precisar de múltiplas expressões cron.
+    - cron: "*/30 * * * *"
 
-  # ── Disparo manual com escolha de período ─────────────────────────
   workflow_dispatch:
     inputs:
-      periodo:
-        description: "Período para testar manualmente"
+      ignorar_horario:
+        description: "Ignorar checagem de horário (rodar mesmo fora da janela, pra testar)"
         required: false
-        default: "manha"
-        type: choice
-        options: [manha, tarde, noite]
+        default: "false"
+        type: boolean
 
 permissions:
   contents: write
@@ -26,54 +22,83 @@ permissions:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 25
+    concurrency:
+      # Evita duas execuções rodando ao mesmo tempo (ex: uma atrasou)
+      group: bot-afiliados
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
 
+      # ── Checa se estamos dentro da janela 07:30–22:00 (Brasília) ──
+      - name: Verificar janela de horário
+        id: horario
+        run: |
+          HORA_UTC=$(date -u +%H)
+          MIN_UTC=$(date -u +%M)
+          # Brasília = UTC-3 (sem horário de verão)
+          MINUTOS_BRT=$(( (10#$HORA_UTC * 60 + 10#$MIN_UTC - 180 + 1440) % 1440 ))
+          INICIO=$(( 7 * 60 + 30 ))   # 07:30
+          FIM=$(( 22 * 60 ))         # 22:00
+
+          if [ "${{ github.event.inputs.ignorar_horario }}" = "true" ]; then
+            echo "dentro=true" >> "$GITHUB_OUTPUT"
+            echo "Forçado manualmente — ignorando checagem de horário."
+          elif [ "$MINUTOS_BRT" -ge "$INICIO" ] && [ "$MINUTOS_BRT" -le "$FIM" ]; then
+            echo "dentro=true" >> "$GITHUB_OUTPUT"
+            echo "Dentro da janela (07:30-22:00 BRT). Prosseguindo."
+          else
+            echo "dentro=false" >> "$GITHUB_OUTPUT"
+            echo "Fora da janela de postagem. Encerrando sem fazer nada."
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.horario.outputs.dentro == 'true'
         with:
           python-version: "3.11"
 
-      # ── Cache da sessão do Instagram entre execuções ──────────────
       - name: Restaurar sessão Instagram (cache)
+        if: steps.horario.outputs.dentro == 'true'
         uses: actions/cache@v4
         with:
           path: /tmp/ig_sessao.json
           key: ig-session-${{ runner.os }}
 
       - name: Instalar dependências Python
+        if: steps.horario.outputs.dentro == 'true'
         run: pip install -r requirements.txt
 
       - name: Instalar Chromium (Playwright)
+        if: steps.horario.outputs.dentro == 'true'
         run: playwright install chromium --with-deps
 
-      # ── Define o período baseado no cron que disparou ─────────────
-      - name: Definir período do dia
-        run: |
-          SCHEDULE="${{ github.event.schedule }}"
-          MANUAL="${{ github.event.inputs.periodo }}"
-          if   [ "$SCHEDULE" = "30 10 * * *" ]; then echo "PERIODO=manha"  >> $GITHUB_ENV
-          elif [ "$SCHEDULE" = "30 15 * * *" ]; then echo "PERIODO=tarde"  >> $GITHUB_ENV
-          elif [ "$SCHEDULE" = "30 22 * * *" ]; then echo "PERIODO=noite"  >> $GITHUB_ENV
-          elif [ -n "$MANUAL" ];                then echo "PERIODO=$MANUAL" >> $GITHUB_ENV
-          else                                       echo "PERIODO=manha"   >> $GITHUB_ENV
-          fi
-
-      # ── ETAPA 1: Scraping de ofertas ──────────────────────────────
-      - name: "🔍 Buscar ofertas (período: ${{ env.PERIODO }})"
+      # ── ETAPA 1: Buscar ofertas novas ──────────────────────────────
+      - name: "🔍 Buscar ofertas novas"
+        if: steps.horario.outputs.dentro == 'true'
         run: python scraper.py
 
-      # ── ETAPA 2: Gerar links de afiliado ──────────────────────────
+      # ── Verifica se apareceu alguma oferta nova ─────────────────────
+      - name: Checar se há ofertas novas
+        id: checar
+        if: steps.horario.outputs.dentro == 'true'
+        run: |
+          QTD=$(python -c "import json; print(len(json.load(open('ofertas.json'))))" 2>/dev/null || echo 0)
+          echo "quantidade=$QTD" >> "$GITHUB_OUTPUT"
+          echo "$QTD oferta(s) nova(s) encontrada(s)."
+
+      # ── ETAPA 2: Gerar links de afiliado (só se achou oferta nova) ──
       - name: "🔗 Gerar links de afiliado"
+        if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         env:
           ML_EMAIL:          ${{ secrets.ML_EMAIL }}
           ML_PASSWORD:       ${{ secrets.ML_PASSWORD }}
           ETIQUETA_AFILIADO: rafaelrafa13
         run: python gerar_links.py
 
-      # ── ETAPA 3: Postar em todos os canais ────────────────────────
+      # ── ETAPA 3: Postar em todos os canais ──────────────────────────
       - name: "📢 Postar no Telegram, Instagram e WhatsApp"
+        if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -89,9 +114,20 @@ jobs:
           WHATSAPP_CHANNEL_JID: ${{ secrets.WHATSAPP_CHANNEL_JID }}
         run: python postar.py
 
-      # ── Salva sessão Instagram no cache ───────────────────────────
       - name: Salvar sessão Instagram (cache)
+        if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         uses: actions/cache@v4
         with:
           path: /tmp/ig_sessao.json
           key: ig-session-${{ runner.os }}
+
+      # ── Salva o histórico de postagens no repositório ────────────────
+      - name: Salvar histórico de ofertas postadas
+        if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
+        run: |
+          git config user.name "bot-afiliados"
+          git config user.email "bot@afiliados.local"
+          git add historico_postados.json
+          git diff --cached --quiet || git commit -m "Atualiza histórico de postagens - $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git pull --rebase --quiet || true
+          git push

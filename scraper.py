@@ -15,7 +15,8 @@ import random
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from utils import (
     configurar_contexto_stealth, aplicar_stealth,
-    espera_humana, scroll_humano, periodo_atual
+    espera_humana, scroll_humano, periodo_atual,
+    carregar_historico
 )
 
 # ── Nichos por período ────────────────────────────────────────────────────────
@@ -166,6 +167,10 @@ def main():
     buscas  = NICHOS[periodo]
     print(f"Período: {periodo.upper()} | {len(buscas)} nichos para buscar\n")
 
+    historico = carregar_historico()
+    ja_postadas = set(historico.keys())
+    print(f"Ofertas já postadas nos últimos dias (ignoradas): {len(ja_postadas)}\n")
+
     vistos  = set()
     ofertas = []
 
@@ -197,11 +202,12 @@ def main():
                 encontrados = scrape_termo(page, busca["q"], busca["min_off"])
                 novos = 0
                 for o in encontrados:
-                    if o["url"] not in vistos:
-                        vistos.add(o["url"])
-                        ofertas.append(o)
-                        novos += 1
-                print(f"    → {novos} nova(s) oferta(s)")
+                    if o["url"] in vistos or o["url"] in ja_postadas:
+                        continue
+                    vistos.add(o["url"])
+                    ofertas.append(o)
+                    novos += 1
+                print(f"    → {novos} nova(s) oferta(s) (não postada(s) antes)")
             except Exception as e:
                 print(f"    → erro: {e}")
 

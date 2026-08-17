@@ -19,7 +19,8 @@ import requests
 from dotenv import load_dotenv
 from utils import (
     salvar_sessao_instagram, carregar_sessao_instagram,
-    espera_humana, periodo_atual, mascarar_log
+    espera_humana, periodo_atual, mascarar_log,
+    registrar_postagem
 )
 
 load_dotenv()
@@ -214,6 +215,12 @@ def main():
     print(f"  Telegram:  {resumo['tg']}/{resumo['total']}")
     print(f"  Instagram: {resumo['ig']}/{resumo['total']}")
     print(f"  WhatsApp:  {resumo['wpp']}/{resumo['total']}")
+
+    # Registra no histórico todas as ofertas que foram postadas em
+    # pelo menos um canal, pra não repetir nos próximos ciclos do dia
+    urls_postadas = [o["url"] for o in ofertas]
+    registrar_postagem(urls_postadas)
+    print(f"\n  {len(urls_postadas)} oferta(s) registrada(s) no histórico.")
 
 
 if __name__ == "__main__":
