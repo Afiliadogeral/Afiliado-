@@ -1,214 +1,168 @@
 """
-scraper.py — Buscador TURBINADO com 20+ nichos, logging, desconto 15%
+scraper.py v3 — Busca via API do ML + requests simples
+Sem Playwright, sem filtro de desconto mínimo agressivo.
+Posta qualquer produto com desconto real.
 """
-import json
-import random
-import logging
+import json, os, time, random, requests, logging
 from datetime import datetime
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from utils import (
-    configurar_contexto_stealth, aplicar_stealth,
-    espera_humana, scroll_humano, periodo_atual, carregar_historico
-)
+from utils import carregar_historico, periodo_atual
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(message)s",
     handlers=[logging.FileHandler("scraper.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-NICHOS = {
-    "manha": [
-        {"q": "whey protein",             "min_off": 15},
-        {"q": "whey isolado",             "min_off": 15},
-        {"q": "creatina",                 "min_off": 15},
-        {"q": "bcaa",                     "min_off": 15},
-        {"q": "pre treino",               "min_off": 12},
-        {"q": "termogenico",              "min_off": 15},
-        {"q": "roupa academia feminina",  "min_off": 18},
-        {"q": "roupa academia masculina", "min_off": 18},
-        {"q": "short fitness",            "min_off": 18},
-        {"q": "top fitness",              "min_off": 18},
-        {"q": "shaker",                   "min_off": 18},
-        {"q": "fone bluetooth fitness",   "min_off": 18},
-        {"q": "garrafa agua",             "min_off": 15},
-        {"q": "suplemento",               "min_off": 15},
-        {"q": "fitness",                  "min_off": 15},
-    ],
-    "tarde": [
-        {"q": "racao cachorro",           "min_off": 15},
-        {"q": "racao gato",               "min_off": 15},
-        {"q": "racao premium",            "min_off": 15},
-        {"q": "coleira cachorro",         "min_off": 15},
-        {"q": "arreio cachorro",          "min_off": 15},
-        {"q": "cama pet",                 "min_off": 15},
-        {"q": "brinquedo pet",            "min_off": 15},
-        {"q": "shampoo pet",              "min_off": 15},
-        {"q": "antipulgas",               "min_off": 15},
-        {"q": "vitamina pet",             "min_off": 15},
-        {"q": "pet shop",                 "min_off": 12},
-        {"q": "cachorro",                 "min_off": 12},
-        {"q": "gato",                     "min_off": 12},
-    ],
-    "noite": [
-        {"q": "tenis",                    "min_off": 15},
-        {"q": "tenis esportivo",          "min_off": 15},
-        {"q": "camiseta",                 "min_off": 18},
-        {"q": "bermuda",                  "min_off": 18},
-        {"q": "jaqueta",                  "min_off": 15},
-        {"q": "roupas",                   "min_off": 18},
-        {"q": "fone",                     "min_off": 15},
-        {"q": "smartwatch",               "min_off": 15},
-        {"q": "mochila",                  "min_off": 18},
-        {"q": "relogio",                  "min_off": 15},
-        {"q": "garrafa termica",          "min_off": 18},
-        {"q": "moda",                     "min_off": 15},
-    ],
+# Headers que imitam browser real
+HEADERS_ML = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+    "Referer": "https://www.mercadolivre.com.br/",
+    "Origin": "https://www.mercadolivre.com.br",
 }
 
-MAX_FINAL = 10
-MAX_POR_TERMO = 20
+# TODOS os nichos combinados — sem separação por período
+# Busca tudo de uma vez, pega os com maior desconto
+TERMOS = [
+    # Fitness / Suplementos
+    "whey protein", "creatina", "pre treino", "bcaa", "colageno",
+    "termogenico", "glutamina", "vitamina c", "omega 3",
+    # Roupas fitness
+    "legging fitness", "camiseta dry fit", "short academia",
+    # Pet
+    "racao golden", "racao royal canin", "antipulgas nexgard",
+    "comedouro automatico", "cama pet", "coleira cachorro",
+    # Moda
+    "tenis nike", "tenis adidas", "tenis masculino", "tenis feminino",
+    "camiseta masculina", "bermuda masculina",
+    # Eletronicos / Acessorios
+    "fone bluetooth", "smartwatch", "carregador rapido",
+    "mochila escolar", "garrafa termica stanley",
+]
+
+MAX_POR_TERMO = 5
+MAX_FINAL = 8
+DESCONTO_MINIMO = 5  # aceitamos qualquer desconto acima de 5%
 
 
-def extrair_numero(texto):
-    if not texto:
-        return None
-    limpo = "".join(c for c in texto if c.isdigit() or c == ",")
+def buscar_api_ml(termo):
+    """Usa a API pública do ML para buscar produtos com desconto."""
+    url = "https://api.mercadolibre.com/sites/MLB/search"
+    params = {
+        "q": termo,
+        "limit": 10,
+        "sort": "price_asc",
+        "tag": "on_sale",  # apenas produtos em oferta
+    }
     try:
-        return float(limpo.replace(",", "."))
-    except Exception:
-        return None
+        r = requests.get(url, params=params, headers=HEADERS_ML, timeout=15)
+        if r.status_code != 200:
+            logger.warning(f"  API retornou {r.status_code} para '{termo}'")
+            return []
+        dados = r.json()
+        return dados.get("results", [])
+    except Exception as e:
+        logger.error(f"  Erro na API para '{termo}': {e}")
+        return []
 
 
-def extrair_oferta(card):
+def processar_item(item):
+    """Extrai dados relevantes de um item da API do ML."""
     try:
-        titulo_el = card.query_selector(".ui-search-item__title, .poly-component__title")
-        if not titulo_el:
-            return None
-        titulo = titulo_el.inner_text().strip()
-        if not titulo or len(titulo) < 10:
+        titulo = item.get("title", "")
+        if not titulo or len(titulo) < 5:
             return None
 
-        badge_el = card.query_selector(".andes-badge--discount, [class*='discount'], .ui-search-price__discount")
-        desconto = 0
-        if badge_el:
-            numeros = "".join(c for c in badge_el.inner_text().upper() if c.isdigit())
-            desconto = int(numeros) if numeros else 0
+        preco_atual = float(item.get("price", 0))
+        preco_orig = float(item.get("original_price") or preco_atual)
 
-        preco_el = card.query_selector(
-            ".ui-search-price__part:not(.ui-search-price__original-value) .andes-money-amount__fraction"
-        )
-        preco_atual = extrair_numero(preco_el.inner_text() if preco_el else None)
-        if not preco_atual or preco_atual < 5:
+        if preco_atual <= 0:
             return None
 
-        orig_el = card.query_selector(".ui-search-price__original-value .andes-money-amount__fraction")
-        preco_orig = extrair_numero(orig_el.inner_text() if orig_el else None)
-        if not preco_orig or preco_orig <= preco_atual:
-            preco_orig = preco_atual
-
-        if desconto == 0 and preco_orig > preco_atual:
+        # Calcula desconto
+        if preco_orig > preco_atual:
             desconto = round((1 - preco_atual / preco_orig) * 100)
+        else:
+            desconto = 0
 
-        link_el = card.query_selector("a.ui-search-link, a.poly-component__title, a[href*='produto.mercadolivre']")
-        if not link_el:
-            return None
-        url = (link_el.get_attribute("href", timeout=3000) or "").split("#")[0].split("?")[0]
-        if not url or "mercadolivre" not in url:
+        if desconto < DESCONTO_MINIMO:
             return None
 
-        img_el = card.query_selector("img.ui-search-result-image__element, img.poly-component__picture, img[src*='mlstatic']")
+        url = item.get("permalink", "")
+        if not url:
+            return None
+
+        # Imagem
         imagem = ""
-        if img_el:
-            imagem = (img_el.get_attribute("src") or img_el.get_attribute("data-src") or "")
-        imagem = imagem.replace("http://", "https://")
+        thumb = item.get("thumbnail", "")
+        if thumb:
+            # Pega imagem em maior resolução
+            imagem = thumb.replace("-I.jpg", "-O.jpg").replace("http://", "https://")
+
         if not imagem:
             imagem = "https://via.placeholder.com/500x500?text=Oferta"
 
         return {
-            "titulo": titulo, "preco_original": preco_orig,
-            "preco_atual": preco_atual, "desconto": desconto,
-            "url": url, "imagem": imagem, "link_afiliado": "",
+            "titulo": titulo,
+            "preco_original": round(preco_orig, 2),
+            "preco_atual": round(preco_atual, 2),
+            "desconto": desconto,
+            "url": url,
+            "imagem": imagem,
+            "link_afiliado": "",
         }
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Erro processando item: {e}")
         return None
-
-
-def scrape_termo(page, termo, min_off):
-    url = f"https://lista.mercadolivre.com.br/{termo.replace(' ', '-')}_PriceDiscount_10-100"
-    for tentativa in range(1, 4):
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            espera_humana(2, 5)
-            scroll_humano(page, vezes=random.randint(2, 4))
-            espera_humana(1, 3)
-            break
-        except Exception as e:
-            logger.warning(f"  Tentativa {tentativa}/3 falhou: {e}")
-            if tentativa == 3:
-                return []
-            espera_humana(3, 6)
-
-    cards = page.query_selector_all(".ui-search-result__wrapper")[:MAX_POR_TERMO]
-    encontrados = []
-    for card in cards:
-        oferta = extrair_oferta(card)
-        if oferta and oferta["desconto"] >= min_off:
-            encontrados.append(oferta)
-    logger.info(f"  → {len(encontrados)} oferta(s) com >= {min_off}% OFF")
-    return encontrados
 
 
 def main():
     periodo = periodo_atual()
-    buscas = NICHOS[periodo]
     logger.info("=" * 60)
-    logger.info(f"PERÍODO: {periodo.upper()} | {len(buscas)} nichos")
+    logger.info(f"SCRAPER v3 | Período: {periodo.upper()} | {len(TERMOS)} termos")
+    logger.info(f"Desconto mínimo: {DESCONTO_MINIMO}%")
     logger.info("=" * 60)
 
     historico = carregar_historico()
     ja_postadas = set(historico.keys())
-    logger.info(f"No histórico (ignoradas): {len(ja_postadas)}")
+    logger.info(f"Histórico: {len(ja_postadas)} URLs já postadas (ignoradas)")
 
-    vistos, ofertas = set(), []
+    vistos = set()
+    ofertas = []
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-blink-features=AutomationControlled"],
-        )
-        ctx = browser.new_context(**configurar_contexto_stealth())
-        page = ctx.new_page()
-        aplicar_stealth(page)
+    # Embaralha termos para variar o conteúdo a cada rodada
+    termos_shuffled = TERMOS.copy()
+    random.shuffle(termos_shuffled)
 
-        try:
-            page.goto("https://www.mercadolivre.com.br", wait_until="domcontentloaded", timeout=30000)
-            espera_humana(2, 4)
-        except Exception:
-            pass
+    for i, termo in enumerate(termos_shuffled, 1):
+        logger.info(f"[{i}/{len(termos_shuffled)}] Buscando: '{termo}'")
+        itens = buscar_api_ml(termo)
+        novos = 0
+        for item in itens[:MAX_POR_TERMO]:
+            oferta = processar_item(item)
+            if not oferta:
+                continue
+            if oferta["url"] in vistos or oferta["url"] in ja_postadas:
+                continue
+            vistos.add(oferta["url"])
+            ofertas.append(oferta)
+            novos += 1
 
-        for i, busca in enumerate(buscas, 1):
-            logger.info(f"[{i}/{len(buscas)}] '{busca['q']}' (>={busca['min_off']}% OFF)")
-            try:
-                for o in scrape_termo(page, busca["q"], busca["min_off"]):
-                    if o["url"] not in vistos and o["url"] not in ja_postadas:
-                        vistos.add(o["url"])
-                        ofertas.append(o)
-            except Exception as e:
-                logger.error(f"  Erro: {e}")
-            espera_humana(4, 9)
+        logger.info(f"  → {novos} oferta(s) nova(s) com >= {DESCONTO_MINIMO}% OFF")
+        time.sleep(random.uniform(0.5, 1.5))  # pausa leve entre requests
 
-        browser.close()
-
+    # Ordena por maior desconto
     ofertas.sort(key=lambda o: o["desconto"], reverse=True)
     selecionadas = ofertas[:MAX_FINAL]
 
     with open("ofertas.json", "w", encoding="utf-8") as f:
         json.dump(selecionadas, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"RESULTADO: {len(selecionadas)} oferta(s) prontas")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"RESULTADO: {len(selecionadas)} oferta(s) prontas para postar")
+    logger.info(f"{'='*60}")
     for o in selecionadas:
         logger.info(f"  {o['desconto']:3d}% OFF | R${o['preco_atual']:.2f} | {o['titulo'][:50]}")
 
