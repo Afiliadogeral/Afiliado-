@@ -2,11 +2,12 @@ name: Bot de Afiliados
 
 on:
   schedule:
+    # A cada 30 minutos
     - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       ignorar_horario:
-        description: "Ignorar checagem de horário"
+        description: "Ignorar checagem de horário (rodar mesmo fora da janela)"
         required: false
         default: "false"
         type: boolean
@@ -25,7 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verificar janela de horário
+      # ── Verificar se está dentro da janela 07:30-22:00 (Brasília) ──
+      - name: "⏰ Verificar janela de horário"
         id: horario
         run: |
           HORA_UTC=$(date -u +%H)
@@ -36,13 +38,13 @@ jobs:
 
           if [ "${{ github.event.inputs.ignorar_horario }}" = "true" ]; then
             echo "dentro=true" >> "$GITHUB_OUTPUT"
-            echo "Forçado manualmente — ignorando checagem de horário."
+            echo "✓ Forçado manualmente — ignorando checagem de horário."
           elif [ "$MINUTOS_BRT" -ge "$INICIO" ] && [ "$MINUTOS_BRT" -le "$FIM" ]; then
             echo "dentro=true" >> "$GITHUB_OUTPUT"
-            echo "Dentro da janela (07:30-22:00 BRT). Prosseguindo."
+            echo "✓ Dentro da janela (07:30-22:00 BRT). Prosseguindo."
           else
             echo "dentro=false" >> "$GITHUB_OUTPUT"
-            echo "Fora da janela de postagem. Encerrando."
+            echo "⏸ Fora da janela de postagem ($(printf '%02d:%02d' $((MINUTOS_BRT / 60)) $((MINUTOS_BRT % 60)))). Encerrando."
           fi
 
       - uses: actions/setup-python@v5
@@ -50,41 +52,49 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restaurar sessão Instagram (cache)
+      - name: "🔧 Restaurar sessão Instagram (cache)"
         if: steps.horario.outputs.dentro == 'true'
         uses: actions/cache@v4
         with:
           path: /tmp/ig_sessao.json
           key: ig-session-${{ runner.os }}
 
-      - name: Instalar dependências Python
+      - name: "📦 Instalar dependências Python"
         if: steps.horario.outputs.dentro == 'true'
         run: pip install -r requirements.txt
 
-      - name: Instalar Chromium
+      - name: "🌐 Instalar Chromium (Playwright)"
         if: steps.horario.outputs.dentro == 'true'
         run: playwright install chromium --with-deps
 
-      - name: "🔍 Buscar ofertas novas"
+      # ── ETAPA 1: SCRAPING DE OFERTAS ──────────────────────────────────
+      - name: "🔍 Buscar ofertas no Mercado Livre (20+ nichos)"
         if: steps.horario.outputs.dentro == 'true'
-        run: python scraper.py
+        run: python scraper.py 2>&1 | tee scraper_output.log
 
-      - name: Checar se há ofertas novas
+      # ── Verificar se achou algo ───────────────────────────────────────
+      - name: "📊 Checar quantas ofertas foram encontradas"
         id: checar
         if: steps.horario.outputs.dentro == 'true'
         run: |
           QTD=$(python -c "import json; print(len(json.load(open('ofertas.json'))))" 2>/dev/null || echo 0)
           echo "quantidade=$QTD" >> "$GITHUB_OUTPUT"
-          echo "$QTD oferta(s) nova(s) encontrada(s)."
+          if [ "$QTD" -gt 0 ]; then
+            echo "✓ $QTD oferta(s) encontrada(s). Prosseguindo com geração de links..."
+          else
+            echo "⚠ Nenhuma oferta encontrada nesta rodada. Abortando postagem."
+          fi
 
-      - name: "🔗 Gerar links de afiliado"
+      # ── ETAPA 2: GERAR LINKS DE AFILIADO ──────────────────────────────
+      - name: "🔗 Gerar links de afiliado (Portal ML)"
         if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         env:
           ML_EMAIL:          ${{ secrets.ML_EMAIL }}
           ML_PASSWORD:       ${{ secrets.ML_PASSWORD }}
           ETIQUETA_AFILIADO: rafaelrafa13
-        run: python gerar_links.py
+        run: python gerar_links.py 2>&1 | tee links_output.log
 
+      # ── ETAPA 3: POSTAR EM TODOS OS CANAIS ────────────────────────────
       - name: "📢 Postar no Telegram, Instagram e WhatsApp"
         if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         env:
@@ -100,16 +110,17 @@ jobs:
           EVOLUTION_API_KEY:    ${{ secrets.EVOLUTION_API_KEY }}
           EVOLUTION_INSTANCE:   ${{ secrets.EVOLUTION_INSTANCE }}
           WHATSAPP_CHANNEL_JID: ${{ secrets.WHATSAPP_CHANNEL_JID }}
-        run: python postar.py
+        run: python postar.py 2>&1 | tee poster_output.log
 
-      - name: Salvar sessão Instagram
+      - name: "💾 Salvar sessão Instagram (cache)"
         if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         uses: actions/cache@v4
         with:
           path: /tmp/ig_sessao.json
           key: ig-session-${{ runner.os }}
 
-      - name: Salvar histórico
+      # ── GUARDAR HISTÓRICO ────────────────────────────────────────────
+      - name: "📝 Salvar histórico de ofertas postadas"
         if: steps.horario.outputs.dentro == 'true' && steps.checar.outputs.quantidade != '0'
         run: |
           git config user.name "bot-afiliados"
@@ -117,4 +128,17 @@ jobs:
           git add historico_postados.json
           git diff --cached --quiet || git commit -m "Atualiza histórico - $(date -u +'%Y-%m-%d %H:%M UTC')"
           git pull --rebase --quiet || true
-          git push
+          git push || true
+
+      # ── Upload de logs para debug ────────────────────────────────────
+      - name: "📋 Salvar logs da execução"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-logs-${{ job.status }}-${{ github.run_id }}
+          path: |
+            scraper_output.log
+            links_output.log
+            poster_output.log
+            scraper.log
+          retention-days: 7
